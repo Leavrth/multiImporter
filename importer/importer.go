@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,10 +19,11 @@ type tableDB struct {
 
 type Importer struct {
 	tableDBs []*tableDB
+	tableDDL []ColumnDDL
 }
 
 func NewImporter(path string) (*Importer, error) {
-	configs := parse(path)
+	configs, tableDDL := parse(path)
 	tableDBs := make([]*tableDB, 0, len(configs))
 	for _, config := range configs {
 		db, err := sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)", config.User, config.Passwd, config.Host, config.Port))
@@ -38,8 +40,10 @@ func NewImporter(path string) (*Importer, error) {
 			db:     db,
 		})
 	}
+
 	return &Importer{
 		tableDBs,
+		tableDDL,
 	}, nil
 }
 
@@ -47,6 +51,24 @@ func (i *Importer) Close() {
 	for _, tableDB := range i.tableDBs {
 		tableDB.db.Close()
 	}
+}
+
+func generateInsertQueryTemplate(tableDDL []ColumnDDL) string {
+	var strBuilder strings.Builder
+	var argBuilder strings.Builder
+	for i, columnDDL := range tableDDL {
+		var str1 string
+		if i != len(tableDDL) {
+			str1 = fmt.Sprintf("`%s`, ", columnDDL.ColumnName)
+			argBuilder.WriteString("?, ")
+		} else {
+			str1 = fmt.Sprintf("`%s`", columnDDL.ColumnName)
+			argBuilder.WriteString("?")
+		}
+		strBuilder.WriteString(str1)
+	}
+	return fmt.Sprintf("INSERT INTO %%s.%%s (%s) VALUES (%s)", strBuilder.String(), argBuilder.String())
+
 }
 
 func randString(len int) string {
@@ -58,23 +80,22 @@ func randString(len int) string {
 	return string(bytes)
 }
 
-type ARGs struct {
-	uid  int
-	name string
-	desc string
+func randInt(len int) int {
+	return rand.Intn(1 << len)
 }
 
-func (i *Importer) Start(ctx context.Context) error {
+func (impt *Importer) Start(ctx context.Context) error {
 	ctxx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
-	sqlCh := make(chan *ARGs, 1024)
+	argsCh := make(chan []interface{}, 1024)
 	errCh := make(chan error)
-	for _, tableDB := range i.tableDBs {
+	queryTmpl := generateInsertQueryTemplate(impt.tableDDL)
+	for _, tableDB := range impt.tableDBs {
 		for schema, tables := range tableDB.tables {
 			for _, table := range tables {
 				wg.Add(1)
-				go func(ctx context.Context, db *sql.DB, schema, table string, sqlCh chan *ARGs, errCh chan error) {
+				go func(ctx context.Context, db *sql.DB, schema, table string, argsCh chan []interface{}, errCh chan error) {
 					defer wg.Done()
 					tx, err := db.Begin()
 					if err != nil {
@@ -85,7 +106,7 @@ func (i *Importer) Start(ctx context.Context) error {
 						return
 					}
 
-					stmt, err := tx.Prepare(fmt.Sprintf("INSERT INTO %s.%s (`uid`, `name`, `desc`) VALUES (?, ?, ?)", schema, table))
+					stmt, err := tx.Prepare(fmt.Sprintf(queryTmpl, schema, table))
 					if err != nil {
 						select {
 						case <-ctxx.Done():
@@ -97,13 +118,13 @@ func (i *Importer) Start(ctx context.Context) error {
 						select {
 						case <-ctxx.Done():
 							return
-						case sql, ok := <-sqlCh:
-							if !ok && sql == nil {
+						case args, ok := <-argsCh:
+							if !ok && args == nil {
 								fmt.Println("Finish, break!")
 								tx.Commit()
 								return
 							}
-							_, err := stmt.Exec(sql.uid, sql.name, sql.desc)
+							_, err := stmt.Exec(args)
 							if err != nil {
 								select {
 								case <-ctxx.Done():
@@ -114,7 +135,7 @@ func (i *Importer) Start(ctx context.Context) error {
 						}
 					}
 
-				}(ctxx, tableDB.db, schema, table, sqlCh, errCh)
+				}(ctxx, tableDB.db, schema, table, argsCh, errCh)
 			}
 		}
 	}
@@ -122,23 +143,24 @@ func (i *Importer) Start(ctx context.Context) error {
 	rand.Seed(time.Now().UnixNano())
 
 	// uid int, name varchar(20), desc varchar(40)
-	for uid := 0; uid < 1000000; uid++ {
-		name := randString(19)
-		desc := randString(39)
-		args := &ARGs{
-			uid,
-			name,
-			desc,
+	for i := 0; i < 1000000; i++ {
+		args := make([]interface{}, len(impt.tableDDL))
+		for j, columnDDL := range impt.tableDDL {
+			switch columnDDL.ColumnType {
+			case CString:
+				args[j] = randString(columnDDL.ColumnLen)
+			case CInt:
+				args[j] = randInt(columnDDL.ColumnLen)
+			}
 		}
-		fmt.Printf("[uid = %d][name = %s][desc = %s]\n", uid, name, desc)
 		select {
-		case sqlCh <- args:
+		case argsCh <- args:
 
 		case err := <-errCh:
 			return err
 		}
 	}
-	close(sqlCh)
+	close(argsCh)
 	wg.Wait()
 	return nil
 }

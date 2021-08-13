@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"multiImporter/importer"
 )
 
 func main() {
-	importer.NewImporter("123").Start()
+	importer, _ := importer.NewImporter("123")
+	importer.Start(context.Background())
 }
